@@ -25,15 +25,16 @@ impl LLVMContext {
     fn initialize() {
         unsafe {
             if LLVM_InitializeNativeTarget() != 0 {
-                panic!("Could not initialize target");
+                panic!("Failed to initialize native target")
             }
-
-            if LLVM_InitializeNativeAsmPrinter() != 0 {
-                panic!("Could not initialize ASM printer");
-            }
-
             if LLVM_InitializeNativeAsmParser() != 0 {
-                panic!("Could not initialize ASM parser");
+                panic!("Failed to initialize native asm parser")
+            } 
+            if LLVM_InitializeNativeAsmPrinter() != 0 {
+                panic!("Failed to initialize native asm printer")
+            } 
+            if LLVM_InitializeNativeDisassembler() != 0 {
+                panic!("Failed to initialize native disassembler")
             }
         }
     }
@@ -391,42 +392,28 @@ fn main() {
 
     // execution engine
 
+    unsafe {LLVMLinkInMCJIT();};
     let execution_engine = unsafe {
-        let mut engine = MaybeUninit::uninit();
-        let mut error = std::ptr::null_mut();
-    
-        // LLVMLinkInMCJIT();
-        match (LLVM_InitializeNativeTarget()) {
-            0 => {}
-            _ => {
-                panic!("Could not initialize target");
-            }
-        }
-        match (LLVM_InitializeNativeAsmPrinter()) {
-            0 => {}
-            _ => {
-                panic!("Could not initialize ASM printer");
-            }
-            
-        }
+        let mut out_ee = MaybeUninit::uninit();
+        let mut out_error = MaybeUninit::uninit();
 
-        match (LLVMCreateExecutionEngineForModule(engine.as_mut_ptr(), llvm_ctx.module, &mut error)) {
-            0 => {
-                LLVMDisposeMessage(error);
-                panic!("Could not create execution engine");
-            }
-            _ => engine,
+        if LLVMCreateExecutionEngineForModule(out_ee.as_mut_ptr(), llvm_ctx.module, out_error.as_mut_ptr()) != 0 { 
+            let error_message = CStr::from_ptr(out_error.assume_init()).to_str().unwrap();
+            panic!("Failed to create execution engine: {}", error_message);
         }
+        out_ee.assume_init()
     };
 
    
     let result = unsafe {
         LLVMRunFunctionAsMain(
-            execution_engine.assume_init(),
+            execution_engine,
             llvm_ctx.symbol_table.get("main").unwrap().clone(),
             0,
             null(),
             null(),
         )
     };
+
+    print!("Result: {}", result);
 }

@@ -1,442 +1,244 @@
+use inkwell::builder::Builder;
+use inkwell::context::Context;
+use inkwell::execution_engine::{ExecutionEngine, JitFunction};
+use inkwell::module::{Linkage, Module};
+use inkwell::values::{BasicValue, BasicValueEnum, PointerValue};
+use inkwell::{AddressSpace, OptimizationLevel};
+
 use std::collections::HashMap;
-use std::ffi::CStr;
-use std::mem;
-use std::mem::MaybeUninit;
-use std::ptr::null;
-use std::str;
-
-use llvm_sys::core::*;
-use llvm_sys::error::LLVMErrorRef;
-use llvm_sys::execution_engine::*;
-use llvm_sys::ir_reader::*;
-use llvm_sys::prelude::*;
-use llvm_sys::target::*;
-use llvm_sys::target_machine::*;
-use llvm_sys::*;
-
-struct LLVMContext {
-    context: LLVMContextRef,
-    builder: LLVMBuilderRef,
-    module: LLVMModuleRef,
-    symbol_table: HashMap<Identifier, LLVMValueRef>,
-}
-
-impl LLVMContext {
-    fn initialize() {
-        unsafe {
-            if LLVM_InitializeNativeTarget() != 0 {
-                panic!("Failed to initialize native target")
-            }
-            if LLVM_InitializeNativeAsmParser() != 0 {
-                panic!("Failed to initialize native asm parser")
-            } 
-            if LLVM_InitializeNativeAsmPrinter() != 0 {
-                panic!("Failed to initialize native asm printer")
-            } 
-            if LLVM_InitializeNativeDisassembler() != 0 {
-                panic!("Failed to initialize native disassembler")
-            }
-        }
-    }
-    fn new() -> LLVMContext {
-        unsafe {
-            let context = LLVMContextCreate();
-            let builder = LLVMCreateBuilderInContext(context);
-            let module = LLVMModuleCreateWithNameInContext("main\0".as_ptr() as *const i8, context);
-            let symbol_table = HashMap::new();
-            LLVMContext {
-                context: context,
-                builder: builder,
-                module: module,
-                symbol_table: symbol_table,
-            }
-        }
-    }
-
-    pub fn codegen_if_statement(&mut self, if_statement: IfStatement) {
-        let if_block = unsafe {
-            let current_block = LLVMGetInsertBlock(self.builder);
-            // check if the current block is not null
-            assert!(!current_block.is_null());
-            let func = LLVMGetBasicBlockParent(current_block);
-            // check if the parent function is not null
-            assert!(!func.is_null());
-            // Convert LLVMGetBasicBlockName result to Rust String
-            let c_str_current_block_name = CStr::from_ptr(LLVMGetBasicBlockName(current_block));
-            let current_block_name =
-                str::from_utf8(c_str_current_block_name.to_bytes()).expect("Invalid UTF-8 data");
-
-            // Convert LLVMGetValueName result to Rust String
-            let c_str_func_name = CStr::from_ptr(LLVMGetValueName(func));
-            let func_name = str::from_utf8(c_str_func_name.to_bytes()).expect("Invalid UTF-8 data");
-
-            // Now format the Rust Strings
-            let then_block_name = format!("{}_{}_then_block", func_name, current_block_name);
-            let else_block_name = format!("{}_{}_else_block", func_name, current_block_name);
-            let merge_block_name = format!("{}_{}_merge_block", func_name, current_block_name);
-
-            let then_block = LLVMAppendBasicBlockInContext(
-                self.context,
-                func,
-                then_block_name.as_ptr() as *const i8,
-            );
-            let else_block = LLVMAppendBasicBlockInContext(
-                self.context,
-                func,
-                else_block_name.as_ptr() as *const i8,
-            );
-            let merge_block = LLVMAppendBasicBlockInContext(
-                self.context,
-                func,
-                merge_block_name.as_ptr() as *const i8,
-            );
-
-            // codegen the condition
-            let condition = self.codegen_expr(*if_statement.condition);
-
-            // LLVMDumpValue(condition);
-
-            let condition_cast = LLVMBuildIntCast(
-                self.builder,
-                condition,
-                LLVMInt1TypeInContext(self.context),
-                "condition_cast\0".as_ptr() as *const i8,
-            );
-
-            LLVMBuildCondBr(self.builder, condition_cast, then_block, else_block);
-            LLVMPositionBuilderAtEnd(self.builder, then_block);
-            // codegen the then block
-            self.codegen_expr(*if_statement.then_block);
-            // check if previous was a return statement
-            let then_terminator = LLVMGetBasicBlockTerminator(then_block);
-            if then_terminator.is_null() {
-                LLVMBuildBr(self.builder, merge_block);
-            }
-
-            LLVMPositionBuilderAtEnd(self.builder, else_block);
-            // codegen the else block
-            self.codegen_expr(*if_statement.else_block);
-
-            let else_terminator = LLVMGetBasicBlockTerminator(else_block);
-            if else_terminator.is_null() {
-                LLVMBuildBr(self.builder, merge_block);
-            }
-
-            LLVMPositionBuilderAtEnd(self.builder, merge_block);
-
-            let phi_node = LLVMBuildPhi(
-                self.builder,
-                LLVMInt32TypeInContext(self.context),
-                "phi\0".as_ptr() as *const i8,
-            );
-            // add incoming values to phi_node
-            let mut incoming_values = vec![
-                LLVMConstInt(LLVMInt32TypeInContext(self.context), 1, 0),
-                LLVMConstInt(LLVMInt32TypeInContext(self.context), 0, 0),
-            ];
-            let mut incoming_blocks = vec![then_block, else_block];
-            LLVMAddIncoming(
-                phi_node,
-                incoming_values.as_mut_ptr(),
-                incoming_blocks.as_mut_ptr(),
-                2,
-            );
-            phi_node
-        };
-    }
-
-    pub fn codegen_binary_expr(&mut self, binary_expr: BinaryExpr) -> LLVMValueRef {
-        match binary_expr.op {
-            BinaryOp::Assign => {
-                let lhs = self.codegen_expr(*binary_expr.lhs);
-                let rhs = self.codegen_expr(*binary_expr.rhs);
-                unsafe {
-                    LLVMBuildStore(self.builder, rhs, lhs);
-                }
-                lhs
-            }
-            BinaryOp::Equal => {
-                let lhs = self.codegen_expr(*binary_expr.lhs);
-                let rhs = self.codegen_expr(*binary_expr.rhs);
-                unsafe {
-                    LLVMBuildICmp(
-                        self.builder,
-                        LLVMIntPredicate::LLVMIntEQ,
-                        lhs,
-                        rhs,
-                        "equal\0".as_ptr() as *const i8,
-                    )
-                }
-            }
-        }
-    }
-    pub fn codegen_literal(&mut self, literal: Literal) -> LLVMValueRef {
-        match literal {
-            Literal::Int(int) => unsafe {
-                LLVMConstInt(LLVMInt32TypeInContext(self.context), int as u64, 0)
-            },
-        }
-    }
-
-    pub fn codegen_identifier(&mut self, identifier: Identifier) -> LLVMValueRef {
-        //   check to see if we have a context block
-        let current_block = unsafe { LLVMGetInsertBlock(self.builder) };
-
-        // check if the current block is not null we want a build alloca
-        if !current_block.is_null() {
-            // check to see if it is defined already in symbol table
-            let value = self.symbol_table.get_mut(&identifier);
-            match value {
-                Some(value) => {
-                    return unsafe {
-                        let llvm_val = *value;
-                        let llvm_ty = LLVMTypeOf(llvm_val);
-                        LLVMBuildLoad2(
-                            self.builder,
-                            llvm_ty,
-                            llvm_val,
-                            identifier.as_ptr() as *const i8,
-                        )
-                    }
-                }
-                None => {
-                    return unsafe {
-                        let alloca = LLVMBuildAlloca(
-                            self.builder,
-                            LLVMInt32TypeInContext(self.context),
-                            identifier.as_ptr() as *const i8,
-                        );
-                        LLVMSetAlignment(alloca, 4);
-                        self.symbol_table.insert(identifier, alloca);
-                        alloca
-                    }
-                }
-            }
-        }
-
-        // throw an error if we don't have a context block
-        panic!("No context block");
-    }
-
-    pub fn codegen_func_def(&mut self, func_def: FuncDef) -> LLVMValueRef {
-        let func = unsafe {
-            let func_ty = LLVMFunctionType(
-                LLVMVoidTypeInContext(self.context),
-                std::ptr::null_mut(),
-                0,
-                0,
-            );
-            let func = LLVMAddFunction(
-                self.module,
-                func_def.name.as_ptr() as *const i8,
-                func_ty,
-            );
-            LLVMSetLinkage(func, LLVMLinkage::LLVMExternalLinkage);
-            func
-        };
-        self.symbol_table.insert(func_def.name.clone(), func);
-        unsafe {
-            let current_block = LLVMAppendBasicBlockInContext(
-                self.context,
-                func,
-                "entry\0".as_ptr() as *const i8,
-            );
-            LLVMPositionBuilderAtEnd(self.builder, current_block);
-        }
-        self.codegen_expr(*func_def.body);
-        func
-    }
-
-    pub fn codegen_stmt(&mut self, stmt: Stmt) -> LLVMValueRef {
-        for expr in stmt.exprs {
-            match expr {
-                Expr::Literal(literal) => {
-                    // codegen a return statement with the literal
-                    let literal = self.codegen_literal(literal);
-                    unsafe {
-                        LLVMBuildRet(self.builder, literal);
-                    }
-                }
-                Expr::Identifier(identifier) => {
-                    // codegen a return statement with the identifier
-                    let identifier = self.codegen_expr(Expr::Identifier(identifier));
-                    unsafe {
-                        LLVMBuildRet(self.builder, identifier);
-                    }
-                }
-                _ => {
-                    self.codegen_expr(expr);
-                }
-            }
-        }
-        unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context), 1, 0) }
-    }
-    pub fn codegen_expr(&mut self, expr: Expr) -> LLVMValueRef {
-        match expr {
-            Expr::Literal(literal) =>  return self.codegen_literal(literal),
-            Expr::Identifier(identifier) => return self.codegen_identifier(identifier),
-            Expr::Stmt(stmt) => return self.codegen_stmt(stmt),
-            Expr::IfStatement(if_statement) =>  self.codegen_if_statement(if_statement),
-            Expr::BinaryExpr(binary_expr) => return self.codegen_binary_expr(binary_expr),
-            Expr::FuncDef(func_def) => return self.codegen_func_def(func_def),
-            Expr::ReturnExpr(expr) =>{
-                let expr = self.codegen_expr(*expr);
-                unsafe {
-                    LLVMBuildRet(self.builder, expr);
-                }
-            }
-
-        }
-        unsafe { LLVMConstInt(LLVMInt32TypeInContext(self.context), 1, 0) }
-    }
- 
-    pub fn dump(&self) {
-        unsafe {
-            LLVMDumpModule(self.module);
-        }
-    }
-}
-#[derive(Debug, Clone)]
-
-enum BinaryOp {
-    Equal,
-    Assign,
-}
-
-#[derive(Debug, Clone)]
-
-struct BinaryExpr {
-    lhs: Box<Expr>,
-    rhs: Box<Expr>,
-    op: BinaryOp,
-}
-#[derive(Debug, Clone)]
-
-enum Literal {
-    Int(i64),
-}
-
-#[derive(Debug, Clone)]
-
-// stmt = vec<expr>
-struct Stmt {
-    exprs: Vec<Expr>,
-}
+use std::error::Error;
+use std::ops::Deref;
 
 type Identifier = String;
 
-#[derive(Debug, Clone)]
-struct Type {
-    name: Identifier,
+#[derive(Debug, Clone, PartialEq)]
+enum TypeExpr {
+    Int,
+    Float,
+    String,
+    Bool,
+    Void,
+    FuncDef {
+        args: Vec<TypeExpr>,
+        return_type: Box<TypeExpr>,
+    },
+    StructDef {
+        name: Identifier,
+        fields: Vec<(Identifier, TypeExpr)>,
+    }
+    
 }
 
-#[derive(Debug, Clone)]
-struct Arg {
-    name: Identifier,
-    ty: Type,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct FuncDef {
     name: Identifier,
-    args: Vec<Arg>,
-    return_ty: Type,
+    return_type: TypeExpr,
+    args: Vec<(Identifier, TypeExpr)>,
     body: Box<Expr>,
 }
 
-#[derive(Debug, Clone)]
-enum Expr {
-    Identifier(Identifier),
-    Literal(Literal),
-    BinaryExpr(BinaryExpr),
-    IfStatement(IfStatement),
-    Stmt(Stmt),
-    FuncDef(FuncDef),
-    ReturnExpr(Box<Expr>),
+#[derive(Debug, Clone, PartialEq)]
+struct Assignment{
+    name: Identifier,
+    value: Box<Expr>,
 }
-#[derive(Debug, Clone)]
 
-struct IfStatement {
+#[derive(Debug, Clone, PartialEq)]
+enum Literal {
+    Int(i64),
+    Float(f64),
+    String(String),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IfExpr {
     condition: Box<Expr>,
-    then_block: Box<Expr>,
-    else_block: Box<Expr>,
+    then_expr: Box<Expr>,
+    else_expr: Box<Expr>,
 }
 
-fn main() {
-    // initialize LLVM
-    LLVMContext::initialize();
-    let mut llvm_ctx = LLVMContext::new();
+#[derive(Debug, Clone, PartialEq)]
+struct LoopExpr {
+    condition: Box<Expr>,
+    body: Box<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Block {
+    exprs: Vec<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Expr {
+    Literal(Literal),
+    Identifier(Identifier),
+    
+    Assignment(Assignment),
+
+    IfExpr(IfExpr),
+    LoopExpr(LoopExpr),
+
+    FuncDef(FuncDef),
+    FuncCall {
+        name: Identifier,
+        args: Vec<Expr>,
+    },
+    Block(Block),
+    Return(Box<Expr>),
+
+}
+
+struct CodeGen<'ctx> {
+    context: &'ctx Context,
+    module: Module<'ctx>,
+    builder: Builder<'ctx>,
+    execution_engine: ExecutionEngine<'ctx>,
+}
+
+impl<'ctx> CodeGen<'ctx> {
+    fn codegen_expr( &mut self, mut symbol_table: HashMap<Identifier, PointerValue<'ctx>>, expr: &Expr) -> Result<Option<BasicValueEnum<'ctx>>, Box<dyn Error>> {
+        match expr {
+
+            Expr::FuncDef(func_def) => {
+     
+                let param_types = vec![];
+                let func = self.context.i32_type().fn_type(&param_types, false);
+
+                let function_name = func_def.name.as_str();
+
+                let function = self.module.add_function(function_name, func, None);
+
+                let basic_block = self.context.append_basic_block(function, "entry");
+
+                self.builder.position_at_end(basic_block);
+
+                // generate the function body
+
+                let body = self.codegen_expr(symbol_table.clone(), &*func_def.body)?; 
 
 
+                Ok(None)
+            }
 
-    let main_func = Expr::FuncDef(FuncDef {
+            Expr::Literal(literal) => match literal {
+                Literal::Int(int) => {
+                    let int_type = self.context.i64_type();
+                    let int_value = int_type.const_int(*int as u64, false);
+                    Ok(Some(int_value.into()))
+                }
+                Literal::Float(float) => {
+                    let float_type = self.context.f64_type();
+                    let float_value = float_type.const_float(*float);
+                    Ok(Some(float_value.into()))
+                }
+                Literal::String(string) => {
+                    let string_value = self.context.const_string(string.as_bytes(), false);
+                    Ok(Some(string_value.into()))
+                }
+                Literal::Bool(bool) => {
+                    let bool_type = self.context.bool_type();
+                    let bool_value = bool_type.const_int(*bool as u64, false);
+                    Ok(Some(bool_value.into()))
+                }
+            },
+            Expr::Identifier(name) => {
+                // try to find the variable in the current scope
+                // if not found, try to find the variable in the global scope
+                // if not found, return an error
+
+                if (symbol_table.contains_key(name)) {
+                    let pointer_value = match symbol_table.get(name) {
+                        Some(pointer_value) => pointer_value,
+                        None => return Err("Variable not found".into()),
+                    };
+                    let pointer_type = pointer_value.get_type();
+
+                    let value = self
+                        .builder
+                        .build_load(pointer_type, *pointer_value, name)?;
+
+                    Ok(Some(value))
+                } else {
+                    Err("Variable not found".into())
+                }
+            }
+
+            Expr::Block(block) => {
+                for expr in &block.exprs {
+                    self.codegen_expr(symbol_table.clone(), expr)?;
+                }
+                Ok(None)
+            }
+           
+            // In Expr::Assignment
+            Expr::Assignment(assignment) => {
+                let identifier = &assignment.name;
+                let rhs_val = self.codegen_expr(symbol_table.clone(), &assignment.value)?.unwrap();
+
+                 let val = match symbol_table.clone().get(identifier) {
+                    Some(val) => {
+                        let res = self.builder.build_store(*val, rhs_val)?;
+                        Ok(None)
+                    }
+                    None => {
+                        let alloca = self.builder.build_alloca(rhs_val.get_type(), identifier)?;
+                        let res = self.builder.build_store(alloca, rhs_val)?;
+                        symbol_table.insert(identifier.to_string(), alloca);
+                        Ok(None)
+                    }
+                };
+                val
+            }
+            Expr::Return(expr) => {
+                let return_val = self.codegen_expr(symbol_table.clone(), expr)?.unwrap();
+                self.builder.build_return(Some(&return_val));
+                Ok(None)
+            }
+
+            _ => unimplemented!("codegen_expr for {:?}", expr),
+        }
+    }
+
+    fn dump(&self) {
+        self.module.print_to_stderr();
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let context = Context::create();
+    let module = context.create_module("main");
+
+    let execution_engine = module.create_jit_execution_engine(OptimizationLevel::None)?;
+
+    let mut codegen = CodeGen {
+        context: &context,
+        module,
+        builder: context.create_builder(),
+        execution_engine,
+    };
+    let mut symbol_table = HashMap::new();
+
+    let main_ast = Expr::FuncDef(FuncDef {
         name: "main".to_string(),
+        return_type: TypeExpr::Void,
         args: vec![],
-        return_ty: Type {
-            name: "i32".to_string(),
-        },
-        body: Box::new(Expr::Stmt(Stmt{
-            exprs: vec![
-                // a = 1
-                Expr::BinaryExpr(BinaryExpr {
-                    lhs: Box::new(Expr::Identifier("a".to_string())),
-                    rhs: Box::new(Expr::Literal(Literal::Int(1))),
-                    op: BinaryOp::Assign,
-                }),
-                // b = 2
-                Expr::BinaryExpr(BinaryExpr {
-                    lhs: Box::new(Expr::Identifier("b".to_string())),
-                    rhs: Box::new(Expr::Literal(Literal::Int(1))),
-                    op: BinaryOp::Assign,
-                }),
-
-                // if a == b { return 1 } else { return 0 }
-                Expr::IfStatement(IfStatement {
-                    condition: Box::new(Expr::BinaryExpr(BinaryExpr {
-                        lhs: Box::new(Expr::Identifier("a".to_string())),
-                        rhs: Box::new(Expr::Identifier("b".to_string())),
-                        op: BinaryOp::Equal,
-                    })),
-                    then_block: Box::new(Expr::Stmt(Stmt {
-                        exprs: vec![Expr::Literal(Literal::Int(1))],
-                    })),
-                    else_block: Box::new(Expr::Stmt(Stmt {
-                        exprs: vec![Expr::Literal(Literal::Int(0))],
-                    })),
-                }),
-            ],
-        })),
+        body: Box::new(Expr::Block(
+            Block {
+                exprs: vec![
+                    Expr::Assignment(Assignment {
+                        name: "x".to_string(),
+                        value: Box::new(Expr::Literal(Literal::Int(42))),
+                    }),
+                    Expr::Return(Box::new(Expr::Identifier("x".to_string()))),
+                ],
+            }
+        )),
     });
 
-    llvm_ctx.codegen_expr(main_func);
+    codegen.codegen_expr(symbol_table, &main_ast)?;
 
-    llvm_ctx.dump();
+    codegen.dump();
 
-    // execution engine
-
-
-    let execution_engine = unsafe {
-        LLVMLinkInMCJIT(); 
-        let mut out_ee = MaybeUninit::uninit();
-        let mut out_error = MaybeUninit::uninit();
-
-        if LLVMCreateExecutionEngineForModule(out_ee.as_mut_ptr(), llvm_ctx.module, out_error.as_mut_ptr()) != 0 { 
-            let error_message = CStr::from_ptr(out_error.assume_init()).to_str().unwrap();
-            panic!("Failed to create execution engine: {}", error_message);
-        }
-        out_ee.assume_init()
-    };
-
-   
-    let result = unsafe {
-        LLVMRunFunctionAsMain(
-            execution_engine,
-            llvm_ctx.symbol_table.get("main").unwrap().clone(),
-            0,
-            null(),
-            null(),
-        )
-    };
-
-    print!("Result: {}", result);
+    Ok(())
 }

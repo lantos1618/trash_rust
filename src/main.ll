@@ -1,18 +1,14 @@
-define i32 @main() {
-entry:
+; ModuleID = 'main'
+source_filename = "main"
+
+define i32 @main(i32 %0) {
+main:
   %a = alloca i32, align 4
-  store i32 1, ptr %a, align 4
+  store i32 %0, ptr %a, align 4
   %b = alloca i32, align 4
-  store i32 1, ptr %b, align 4
-  %a1 = load ptr, ptr %a, align 8
-  %b2 = load ptr, ptr %b, align 8
-  %equal = icmp eq ptr %a1, %b2
-  br i1 %equal, label %main_entry_then_block, label %main_entry_else_block
-
-main_entry_then_block:                            ; preds = %entry
-  ret i32 1
-
-main_entry_else_block:                            ; preds = %entry
-  ret i32 0
-
+  %add_left = load i32, ptr %a, align 4
+  %add = add i32 %add_left, 10
+  store i32 %add, ptr %b, align 4
+  %b1 = load i32, ptr %b, align 4
+  ret i32 %b1
 }

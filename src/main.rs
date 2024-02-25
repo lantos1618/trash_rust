@@ -585,13 +585,15 @@ impl<'ctx> CodeGen<'ctx> {
                 let _ = self.builder.build_unconditional_branch(loop_block);
                 self.builder.position_at_end(loop_block);
 
+                let _ = self.codegen_expr(symbol_table, &loop_expr.body)?;
+
                 let condition = self
                     .codegen_expr(symbol_table, &loop_expr.condition)?
                     .unwrap();
                 let loop_condition = self.builder.build_int_compare(
                     inkwell::IntPredicate::NE,
                     condition.into_int_value(),
-                    self.context.i64_type().const_zero(),
+                    self.context.bool_type().const_zero(),
                     "loop_cond",
                 )?;
                 let _ =
@@ -666,7 +668,8 @@ fn run<'ctx>(code_gen: &mut CodeGen<'ctx>) -> Result<(), Box<dyn Error>> {
 
     unsafe {
         let result = execution_engine.run_function(function, &[]);
-        println!("Result: {:?}", result);
+
+        println!("Result: {:?}", result.as_int(false));
     };
 
     Ok(())
@@ -702,20 +705,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
         Expr::FuncDef(FuncDef {
             name: "main".to_string(),
-            return_type: TypeExpr::Int(IntSize::Int32),
+            return_type: TypeExpr::Int(IntSize::Int64),
             args: vec![],
             body: Box::new(Expr::Block(Block {
                 exprs: vec![
                     Expr::Assignment(Assignment {
                         name: "x".to_string(),
-                        value: Box::new(Expr::Literal(Literal::Int(42))),
+                        value: Box::new(Expr::Literal(Literal::Int(12))),
                     }),
                     // loop(x < 100) { x = x + 1 }
                     Expr::LoopExpr(LoopExpr {
                         condition: Box::new(Expr::BinaryExpr(BinaryExpr {
                             op: BinaryOp::Lt,
                             lhs: Box::new(Expr::Identifier("x".to_string())),
-                            rhs: Box::new(Expr::Literal(Literal::Int(100))),
+                            rhs: Box::new(Expr::Literal(Literal::Int(420_000_000))),
                         })),
                         body: Box::new(Expr::Block(Block {
                             exprs: vec![Expr::Assignment(Assignment {
@@ -728,12 +731,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                             })],
                         })),
                     }),
-                    Expr::FuncCall(FuncCall {
-                        name: "printf".to_string(),
-                        args: vec![Expr::Literal(Literal::String(
-                            "Hello, world!\n".to_string(),
-                        ))],
-                    }),
+                    // Expr::FuncCall(FuncCall {
+                    //     name: "printf".to_string(),
+                    //     args: vec![Expr::Literal(Literal::String(
+                    //         "Hello, world!\n".to_string(),
+                    //     ))],
+                    // }),
                     Expr::Return(Box::new(Expr::Identifier("x".to_string()))),
                 ],
             })),
